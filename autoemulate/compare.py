@@ -27,7 +27,7 @@ from autoemulate.utils import _check_cv
 from autoemulate.utils import _ensure_2d
 from autoemulate.utils import _get_full_model_name
 from autoemulate.utils import _redirect_warnings
-from autoemulate.utils import get_model_name
+from autoemulate.utils import get_model_namef
 from autoemulate.utils import get_short_model_name
 
 
