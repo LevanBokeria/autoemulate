@@ -31,7 +31,7 @@ def _turn_models_into_multioutput(models, y):
 
 
 def _wrap_models_in_pipeline(
-    models, scale, scaler, reduce_dim, dim_reducer, preprocess_outputs=None
+    models, scale, scaler, reduce_dim, dim_reducer, preprocess_outputs
 ):
     """Wrap models in a pipeline if scale is True.
 
@@ -55,28 +55,28 @@ def _wrap_models_in_pipeline(
     """
 
     models_piped = []
-
-    for model in models:
-        steps = []
-        if preprocess_outputs:
-            # If preprocess_outputs is 'vae', use our custom VAE preprocessor
-            if preprocess_outputs == 'vae':
-                steps.append(("output_preprocessor", VAEOutputPreprocessor(
-                    latent_dim=4,  # Dimension of latent space
-                    epochs=150,    # Number of training epochs
-                    batch_size=8, # Batch size for training
-                    hidden_dims=[32, 16, 8]  # Architecture of encoder/decoder
-                )))
-            else:
-                # Otherwise use the original OutputOnlyPreprocessor
-                steps.append(("output_preprocessor", OutputOnlyPreprocessor(methods=preprocess_outputs)))
-        if scale:
-            steps.append(("scaler", scaler))
-        if reduce_dim:
-            steps.append(("dim_reducer", dim_reducer))
-        steps.append(("model", model))
-        # without scaling or dim reduction, the model is the only step
-        models_piped.append(Pipeline(steps))
+    for preprocess_method in preprocess_outputs:
+        for model in models:
+            steps = []
+            if preprocess_outputs:
+                # If preprocess_outputs is 'vae', use our custom VAE preprocessor
+                if preprocess_method == 'vae':
+                    steps.append(("output_preprocessor", VAEOutputPreprocessor(
+                        latent_dim=4,  # Dimension of latent space
+                        epochs=150,    # Number of training epochs
+                        batch_size=8, # Batch size for training
+                        hidden_dims=[32, 16, 8]  # Architecture of encoder/decoder
+                    )))
+                else:
+                    # Otherwise use the original OutputOnlyPreprocessor
+                    steps.append(("output_preprocessor", OutputOnlyPreprocessor(methods=preprocess_method)))
+            if scale:
+                steps.append(("scaler", scaler))
+            if reduce_dim:
+                steps.append(("dim_reducer", dim_reducer))
+            steps.append(("model", model))
+            # without scaling or dim reduction, the model is the only step
+            models_piped.append(Pipeline(steps))
 
     return models_piped
 
@@ -114,6 +114,6 @@ def _process_models(
     models = model_registry.get_models(model_names)
     models_multi = _turn_models_into_multioutput(models, y)
     models_scaled = _wrap_models_in_pipeline(
-        models_multi, scale, scaler, reduce_dim, dim_reducer
+        models_multi, scale, scaler, reduce_dim, dim_reducer, preprocess_outputs
     )
     return models_scaled
