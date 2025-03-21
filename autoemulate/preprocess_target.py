@@ -2,13 +2,269 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.base import BaseEstimator, TransformerMixin
+import torch.optim as optim
+from sklearn.base import BaseEstimator
+from sklearn.base import clone
+from sklearn.base import TransformerMixin
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from torch.utils.data import DataLoader
+from torch.utils.data import TensorDataset
+
+
+class VAEOutputPreprocessor(BaseEstimator, TransformerMixin):
+    """
+    A scikit-learn compatible transformer that applies a Variational Autoencoder (VAE)
+    to target values (y) in a sklearn pipeline.
+
+    This class wraps a PyTorch VAE model to preprocess output data through the latent space
+    and provides inverse transformation capabilities.
+
+    Parameters
+    ----------
+    latent_dim : int, default=3
+        Dimension of the latent space.
+    hidden_dims : list, default=[64, 32]
+        Hidden dimensions for the VAE encoder and decoder networks.
+    epochs : int, default=100
+        Number of training epochs for the VAE.
+    batch_size : int, default=32
+        Batch size for training.
+    learning_rate : float, default=1e-3
+        Learning rate for the Adam optimizer.
+    device : str, default='cuda' if available else 'cpu'
+        Device to use for computation.
+    """
+
+    def __init__(
+        self,
+        latent_dim=3,
+        hidden_dims=None,
+        epochs=100,
+        batch_size=32,
+        learning_rate=1e-3,
+        device=None,
+        verbose=False
+    ):
+        self.latent_dim = latent_dim
+        self.hidden_dims = [64, 32] if hidden_dims is None else hidden_dims
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.verbose = verbose 
+        self.vae = None
+        self.is_fitted_ = False
+
+    def _init_vae(self, input_dim):
+        """Initialize the VAE model with the appropriate input dimension."""
+
+        self.vae = VAE(
+            input_dim=input_dim,
+            hidden_dims=self.hidden_dims,
+            latent_dim=self.latent_dim,
+        ).to(self.device)
+
+    def _create_data_loader(self, y):
+        """Create a PyTorch DataLoader for the target values."""
+        y_tensor = torch.FloatTensor(y).to(self.device)
+        dataset = torch.utils.data.TensorDataset(y_tensor)
+        return torch.utils.data.DataLoader(
+            dataset, batch_size=self.batch_size, shuffle=True
+        )
+
+    def fit(self, X, y=None, **fit_params):
+        """
+        Fit the VAE model to the target values.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Input data (not used but required by the sklearn API).
+        y : array-like, shape (n_samples, n_outputs)
+            Target values to transform.
+
+        Returns
+        -------
+        self : object
+            Returns self.
+        """
+        if y is None:
+            raise ValueError(
+                "Target values (y) are required for VAEOutputPreprocessor."
+            )
+
+        # Ensure y is 2D
+        if y.ndim == 1:
+            y = y.reshape(-1, 1)
+
+        # Initialize VAE with input dimension from y
+        self.n_features_out_ = y.shape[1]
+        self._init_vae(input_dim=self.n_features_out_)
+
+        # Create data loader
+        data_loader = self._create_data_loader(y)
+
+        # Train the VAE
+        optimizer = optim.Adam(self.vae.parameters(), lr=self.learning_rate)
+        self.vae.train()
+
+        for epoch in range(self.epochs):
+            total_loss = 0
+            for batch in data_loader:
+                y_batch = batch[0]
+
+                # Zero gradients
+                optimizer.zero_grad()
+
+                # Forward pass
+                recon_y, mu, log_var = self.vae(y_batch)
+
+                # Calculate loss
+                loss = self.vae.loss_function(recon_y, y_batch, mu, log_var)
+
+                # Backward pass and optimize
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+
+            if self.verbose and (epoch + 1) % 10 == 0:
+                print(
+                    f"Epoch {epoch+1}/{self.epochs}, Loss: {total_loss/len(data_loader):.4f}"
+                )
+
+        self.is_fitted_ = True
+        return self
+
+    def transform(self, X, y=None):
+        """
+        Transform the target values using the VAE's latent representation.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Input data (passed through unchanged).
+        y : array-like, shape (n_samples, n_outputs)
+            Target values to transform.
+
+        Returns
+        -------
+        X_new : array-like, shape (n_samples, n_features)
+            Same as input X (unchanged).
+        y_new : array-like, shape (n_samples, latent_dim)
+            Transformed target values (encoded to latent space).
+        """
+        if not self.is_fitted_:
+            raise ValueError("The VAEOutputPreprocessor has not been fitted yet.")
+
+        if y is None:
+            return X
+
+        # Ensure y is 2D
+        if y.ndim == 1:
+            y = y.reshape(-1, 1)
+
+        # Convert to torch tensor
+        y_tensor = torch.FloatTensor(y).to(self.device)
+
+        # Set model to evaluation mode
+        self.vae.eval()
+
+        # Get latent representation (mu part only, no sampling in transform)
+        with torch.no_grad():
+            mu, _ = self.vae.encode(y_tensor)
+            y_transformed = mu.cpu().numpy()
+
+        return X, y_transformed
+
+    def inverse_transform(self, X, y=None):
+        """
+        Inverse transform from latent space back to original target space.
+
+        Parameters
+        ----------
+        X : array-like, shape (n_samples, n_features)
+            Input data (passed through unchanged).
+        y : array-like, shape (n_samples, latent_dim)
+            Latent representations to inverse transform.
+
+        Returns
+        -------
+        X_new : array-like, shape (n_samples, n_features)
+            Same as input X (unchanged).
+        y_new : array-like, shape (n_samples, n_original_outputs)
+            Reconstructed target values in original space.
+        """
+        if not self.is_fitted_:
+            raise ValueError("The VAEOutputPreprocessor has not been fitted yet.")
+
+        if y is None:
+            return X
+
+        # Convert to torch tensor
+        y_tensor = torch.FloatTensor(y).to(self.device)
+
+        # Set model to evaluation mode
+        self.vae.eval()
+
+        # Decode from latent representation
+        with torch.no_grad():
+            y_reconstructed = self.vae.decode(y_tensor).cpu().numpy()
+
+        return X, y_reconstructed
+
+    @property
+    def verbose(self):
+        """Get verbosity setting."""
+        return getattr(self, "_verbose", False)
+
+    @verbose.setter
+    def verbose(self, value):
+        """Set verbosity setting."""
+        self._verbose = value
+
+
+class TargetPCA(BaseEstimator, TransformerMixin):
+    """Transformer that applies PCA to target values (y) only."""
+
+    def __init__(self, n_components):
+        self.n_components = n_components
+        self.pca = PCA(n_components=n_components)
+
+    def fit(self, X, y=None):
+        """Fit the PCA to y, but leave X unchanged."""
+        if y is not None:
+            # Reshape y to 2D if needed
+            y_reshaped = y.reshape(-1, 1) if len(np.array(y).shape) == 1 else y
+            self.pca.fit(y_reshaped)
+        return self
+
+    def transform(self, X, y=None):
+        """Transform y if provided, but leave X unchanged."""
+        if y is not None:
+            # Reshape y to 2D if needed
+            y_reshaped = y.reshape(-1, 1) if len(np.array(y).shape) == 1 else y
+            y_transformed = self.pca.transform(y_reshaped)
+            return X, y_transformed
+        return X, y
+
+    def fit_transform(self, X, y=None):
+        """Fit to y and transform it, but leave X unchanged."""
+        return self.fit(X, y).transform(X, y)
+
+    def inverse_transform(self, X, y=None):
+        """Inverse transform y but leave X unchanged."""
+        if y is not None:
+            y_orig = self.pca.inverse_transform(y)
+            return X, y_orig
+        return X, y
+
 
 class VAE(nn.Module):
     """
     Variational Autoencoder implementation in PyTorch.
-    
+
     Parameters
     ----------
     input_dim : int
@@ -18,9 +274,10 @@ class VAE(nn.Module):
     latent_dim : int
         Dimensionality of the latent space.
     """
+
     def __init__(self, input_dim, hidden_dims, latent_dim):
         super(VAE, self).__init__()
-        
+
         # Encoder layers
         encoder_layers = []
         prev_dim = input_dim
@@ -28,11 +285,11 @@ class VAE(nn.Module):
             encoder_layers.append(nn.Linear(prev_dim, dim))
             encoder_layers.append(nn.ReLU())
             prev_dim = dim
-        
+
         self.encoder = nn.Sequential(*encoder_layers)
         self.fc_mu = nn.Linear(hidden_dims[-1], latent_dim)
         self.fc_var = nn.Linear(hidden_dims[-1], latent_dim)
-        
+
         # Decoder layers
         decoder_layers = []
         prev_dim = latent_dim
@@ -41,27 +298,27 @@ class VAE(nn.Module):
             decoder_layers.append(nn.ReLU())
             prev_dim = dim
         decoder_layers.append(nn.Linear(prev_dim, input_dim))
-        
+
         self.decoder = nn.Sequential(*decoder_layers)
-    
+
     def encode(self, x):
         """Encode input to mean and log variance of latent distribution."""
         x = self.encoder(x)
         mu = self.fc_mu(x)
         log_var = self.fc_var(x)
         return mu, log_var
-    
+
     def reparameterize(self, mu, log_var):
         """Sample from latent distribution using reparameterization trick."""
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
         z = mu + eps * std
         return z
-    
+
     def decode(self, z):
         """Decode latent representation back to original space."""
         return self.decoder(z)
-    
+
     def forward(self, x):
         """Full forward pass through the VAE."""
         mu, log_var = self.encode(x)
@@ -72,435 +329,111 @@ class VAE(nn.Module):
     def loss_function(self, recon_x, x, mu, log_var):
         """Calculate VAE loss: reconstruction + KL divergence."""
         # MSE reconstruction loss
-        recon_loss = F.mse_loss(recon_x, x, reduction='sum')
-        
+        recon_loss = F.mse_loss(recon_x, x, reduction="sum")
+
         # KL divergence
         kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
-        
-        return recon_loss + kl_loss
 
-class VAEOutputPreprocessor(BaseEstimator, TransformerMixin):
-    """
-    A custom transformer for sklearn Pipeline that uses a PyTorch Variational Autoencoder (VAE)
-    to perform dimensionality reduction on y (output) values during model training.
-    
-    Parameters
-    ----------
-    latent_dim : int, default=2
-        The dimensionality of the latent space.
-    
-    epochs : int, default=100
-        Number of epochs to train the VAE.
-    
-    batch_size : int, default=32
-        Batch size for training the VAE.
-    
-    learning_rate : float, default=0.001
-        Learning rate for the optimizer.
-    
-    hidden_dims : list, default=None
-        List of hidden dimensions for the encoder and decoder networks.
-        If None, [64, 32] will be used.
-    
-    verbose : bool, default=False
-        Whether to print training progress.
-        
-    device : str, default=None
-        Device to use for training ('cuda' or 'cpu'). If None, will use
-        CUDA if available, otherwise CPU.
-    """
-    
-    def __init__(self, latent_dim=8, epochs=100, batch_size=32, 
-                 learning_rate=0.001, hidden_dims=None, verbose=False,
-                 device=None):
-        self.latent_dim = latent_dim
-        self.epochs = epochs
-        self.batch_size = batch_size
-        self.learning_rate = learning_rate
-        self.hidden_dims = hidden_dims if hidden_dims is not None else [32, 16]
-        self.verbose = verbose
-        self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
-        self.is_fitted_ = False
-        self.y_transformed_ = None  # Store last transformed y for inverse_transform
-        
-    def fit(self, X, y=None):
-        """
-        Fit the VAE model to the output data y.
-        
-        Parameters
-        ----------
-        X : array-like
-            Input features (not used by this transformer)
-        y : array-like
-            Target values to be preprocessed
-            
-        Returns
-        -------
-        self : object
-            Returns self.
-        """
-        if y is None:
-            return self
-            
-        # Convert y to numpy array if needed
-        if not isinstance(y, np.ndarray):
-            y = np.asarray(y)
-        
-        # Store input dimensionality
-        self.input_dim_ = y.shape[1] if len(y.shape) > 1 else 1
-        
-        # Reshape for 1D inputs
-        if len(y.shape) == 1:
-            y = y.reshape(-1, 1)
-        
-        # Store original y shape
-        self.y_shape_ = y.shape
-        
-        # Convert to PyTorch tensors
-        y_tensor = torch.tensor(y, dtype=torch.float32)
-        
-        # Create dataset and dataloader
-        dataset = TensorDataset(y_tensor)
-        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-        
-        # Initialize model
-        self.model_ = VAE(
-            input_dim=self.input_dim_,
-            hidden_dims=self.hidden_dims,
-            latent_dim=self.latent_dim
-        ).to(self.device)
-        
-        # Initialize optimizer
-        optimizer = torch.optim.Adam(self.model_.parameters(), lr=self.learning_rate)
-        
-        # Training loop
-        self.model_.train()
-        for epoch in range(self.epochs):
-            total_loss = 0
-            for batch in dataloader:
-                batch_y = batch[0].to(self.device)
-                
-                # Forward pass
-                optimizer.zero_grad()
-                recon_y, mu, log_var = self.model_(batch_y)
-                
-                # Compute loss
-                loss = self.model_.loss_function(recon_y, batch_y, mu, log_var)
-                
-                # Backward pass
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-            
-            if self.verbose and (epoch + 1) % 10 == 0:
-                print(f"Epoch {epoch+1}/{self.epochs}, Loss: {total_loss/len(dataloader):.4f}")
-        
-        self.is_fitted_ = True
-        return self
-    
-    def transform(self, X, y=None):
-        """
-        Transform input data X (pass-through) and output data y (if provided).
-        During fitting in a pipeline, y is provided and transformed to the latent space.
-        
-        Parameters
-        ----------
-        X : array-like
-            Input features (returned unchanged)
-        y : array-like, default=None
-            Target values to transform
-            
-        Returns
-        -------
-        X : array-like
-            Original input features
-        y_transformed : array-like or None
-            Transformed target values in the latent space (if y was provided)
-        """
-        # During pipeline.fit(), return X unchanged and transformed y
-        if y is not None and self.is_fitted_:
-            # Convert y to numpy array if needed
-            if not isinstance(y, np.ndarray):
-                y = np.asarray(y)
-            
-            # Store original y for later use in inverse_transform
-            self.original_y_ = y.copy()
-            
-            # Reshape for 1D inputs
-            if len(y.shape) == 1:
-                y = y.reshape(-1, 1)
-            
-            # Convert to PyTorch tensor
-            y_tensor = torch.tensor(y, dtype=torch.float32).to(self.device)
-            
-            # Transform to latent space
-            self.model_.eval()
-            with torch.no_grad():
-                mu, _ = self.model_.encode(y_tensor)
-                y_transformed = mu.cpu().numpy()
-            
-            # Store the transformed y
-            self.y_transformed_ = y_transformed
-            
-            return X, y_transformed
-        
-        # During pipeline.transform() or pipeline.predict(), return X unchanged
-        return X
-    
-    def fit_transform(self, X, y=None):
-        """
-        Fit and transform in one step.
-        
-        Parameters
-        ----------
-        X : array-like
-            Input features
-        y : array-like, default=None
-            Target values
-            
-        Returns
-        -------
-        X : array-like
-            Original input features
-        y_transformed : array-like or None
-            Transformed target values (if y was provided)
-        """
-        return self.fit(X, y).transform(X, y)
-    
-    def inverse_transform_y(self, y_transformed):
-        """
-        Inverse transform the latent space representation back to the original space.
-        
-        Parameters
-        ----------
-        y_transformed : array-like
-            Transformed target values in the latent space
-            
-        Returns
-        -------
-        y : array-like
-            Reconstructed target values in the original space
-        """
-        if not self.is_fitted_:
-            return y_transformed
-            
-        # Convert to numpy array if needed
-        if not isinstance(y_transformed, np.ndarray):
-            y_transformed = np.asarray(y_transformed)
-        
-        # Convert to PyTorch tensor
-        y_tensor = torch.tensor(y_transformed, dtype=torch.float32).to(self.device)
-        
-        # Decode from latent space
-        self.model_.eval()
-        with torch.no_grad():
-            y_reconstructed = self.model_.decode(y_tensor).cpu().numpy()
-        
-        # Reshape if original was 1D
-        if self.input_dim_ == 1:
-            y_reconstructed = y_reconstructed.ravel()
-            
-        return y_reconstructed
-    
-    def inverse_transform(self, X):
-        """
-        Standard sklearn inverse_transform method.
-        Takes transformed X (which in this case is actually the transformed y)
-        and returns the original space representation.
-        
-        Parameters
-        ----------
-        X : array-like
-            Transformed data in the latent space
-            
-        Returns
-        -------
-        X_original : array-like
-            Data reconstructed back to original space
-        """
-        # For pipeline compatibility, treat X as the transformed y values
-        return self.inverse_transform_y(X)
+        return recon_loss + kl_loss
 
 
 class OutputOnlyPreprocessor(BaseEstimator, TransformerMixin):
     """
     A custom transformer for sklearn Pipeline that applies preprocessing
     to only the y (output) values during model training.
-    
-    Parameters
-    ----------
-    methods : str or list of str, default=None
-        The preprocessing method(s) to apply to y.
-        Options include:
-        - 'pca': Apply PCA to reduce dimensionality
-        - 'standardize': Apply StandardScaler
-        - custom methods can be added
-    
-    n_components : int or float, default=None
-        For PCA, the number of components to keep.
-        If None and method includes 'pca', keeps all components.
-    
-    Attributes
-    ----------
-    transformers_ : dict
-        Dictionary of fitted transformer objects with method names as keys.
-    inverse_transformers_ : dict
-        Dictionary of inverse transformation methods for each transformer.
+
+    This implementation is specifically designed to be compatible with
+    scikit-learn's Pipeline by storing the transformed y values and
+    using them in a custom fit method.
     """
-    
-    def __init__(self, methods=None, n_components=None):
+
+    def __init__(self, methods=None, n_components=3):
         self.methods = methods
         self.n_components = n_components
         self.transformers_ = {}
         self.inverse_transformers_ = {}
-        
+
     def fit(self, X, y=None):
         """
-        Fit all the transformers on the output data.
-        
-        Parameters
-        ----------
-        X : array-like
-            Input features (not used in this transformer)
-        y : array-like
-            Target values to be preprocessed
-            
-        Returns
-        -------
-        self : object
-            Returns self.
+        Fit transformers on the output data and store transformed y.
         """
-        if y is None:
+        if y is None or self.methods is None:
             return self
-            
+
         # Ensure y is a numpy array
         y = np.asarray(y)
-        
+
         # Initialize transformers based on methods
-        if self.methods is None:
-            return self
-            
         methods = self.methods if isinstance(self.methods, list) else [self.methods]
-        
+
         for method in methods:
-            if method == 'pca':
-                from sklearn.decomposition import PCA
+            if method == "pca":
                 transformer = PCA(n_components=self.n_components)
                 self.transformers_[method] = transformer.fit(y)
-                self.inverse_transformers_[method] = lambda y_transformed, transformer=transformer: transformer.inverse_transform(y_transformed)
-                
-            elif method == 'standardize':
-                from sklearn.preprocessing import StandardScaler
+                self.inverse_transformers_[
+                    method
+                ] = lambda y_transformed, transformer=transformer: transformer.inverse_transform(
+                    y_transformed
+                )
+
+            elif method == "standardize":
                 transformer = StandardScaler()
                 self.transformers_[method] = transformer.fit(y)
-                self.inverse_transformers_[method] = lambda y_transformed, transformer=transformer: transformer.inverse_transform(y_transformed)
-        
-        # Store original y for reference
+                self.inverse_transformers_[
+                    method
+                ] = lambda y_transformed, transformer=transformer: transformer.inverse_transform(
+                    y_transformed
+                )
+
+        # Store original y
         self.original_y_ = y.copy()
-        self.y_transformed_ = None
-        
+
+        # Transform y and store it
+        self.y_transformed_ = self._transform_y(y)
+
         return self
-    
+
+    def _transform_y(self, y):
+        """Helper method to transform y data."""
+        if self.methods is None:
+            return y
+
+        methods = self.methods if isinstance(self.methods, list) else [self.methods]
+        y_transformed = y.copy()
+
+        for method in methods:
+            if method in self.transformers_:
+                y_transformed = self.transformers_[method].transform(y_transformed)
+
+        return y_transformed
+
     def transform(self, X, y=None):
         """
-        Transform input data X (pass-through) and output data y (if provided).
-        During fitting in a pipeline, y is provided and transformed.
-        
-        Parameters
-        ----------
-        X : array-like
-            Input features (returned unchanged)
-        y : array-like, default=None
-            Target values to transform
-            
-        Returns
-        -------
-        X : array-like
-            Original input features
-        y_transformed : array-like or None
-            Transformed target values (if y was provided)
+        Pass X through unchanged to stay compatible with sklearn Pipeline.
         """
-        # During pipeline.fit(), return X unchanged and transformed y
-        if y is not None and self.methods is not None:
-            y = np.asarray(y)
-            methods = self.methods if isinstance(self.methods, list) else [self.methods]
-            
-            y_transformed = y.copy()
-            for method in methods:
-                if method in self.transformers_:
-                    y_transformed = self.transformers_[method].transform(y_transformed)
-            
-            # Store the transformed y
-            self.y_transformed_ = y_transformed
-            
-            return X, y_transformed
-        
-        # During pipeline.transform() or pipeline.predict(), return X unchanged
+        # Return X unchanged to maintain pipeline compatibility
         return X
-    
+
     def fit_transform(self, X, y=None):
-        """
-        Fit and transform in one step.
-        
-        Parameters
-        ----------
-        X : array-like
-            Input features
-        y : array-like, default=None
-            Target values
-            
-        Returns
-        -------
-        X : array-like
-            Original input features
-        y_transformed : array-like or None
-            Transformed target values (if y was provided)
-        """
-        return self.fit(X, y).transform(X, y)
-    
+        """Fit and transform in one step."""
+        self.fit(X, y)
+        return self.transform(X)
+
     def inverse_transform_y(self, y_transformed):
-        """
-        Inverse transform the output data.
-        
-        Parameters
-        ----------
-        y_transformed : array-like
-            Transformed target values
-            
-        Returns
-        -------
-        y : array-like
-            Original target values
-        """
+        """Inverse transform the output data."""
         if self.methods is None or not self.transformers_:
             return y_transformed
-            
+
         methods = self.methods if isinstance(self.methods, list) else [self.methods]
         y = y_transformed.copy()
-        
+
         # Apply inverse transformations in reverse order
         for method in reversed(methods):
             if method in self.inverse_transformers_:
                 y = self.inverse_transformers_[method](y)
-                
+
         return y
-    
+
     def inverse_transform(self, X):
-        """
-        Standard sklearn inverse_transform method.
-        Takes transformed X (which in this case is actually the transformed y)
-        and returns the original space representation.
-        
-        Parameters
-        ----------
-        X : array-like
-            Transformed data
-            
-        Returns
-        -------
-        X_original : array-like
-            Data reconstructed back to original space
-        """
-        # For pipeline compatibility, treat X as the transformed y values
-        return self.inverse_transform_y(X)
+        """Standard sklearn inverse_transform method."""
+        return X

@@ -475,7 +475,6 @@ class AutoEmulate:
                 methods=self.preprocess_outputs
             ).inverse_transform(y_pred)
 
-
         y_true = self.y[self.test_idxs]
 
         scores = {}
